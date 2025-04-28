@@ -25,7 +25,7 @@
         <h2 class="text-lg font-semibold">DICOM Segmentation</h2>
         <div class="flex items-center gap-4">
           <input type="text" placeholder="Search" class="bg-gray-900 rounded px-3 py-1.5 text-sm" />
-          <div class="bg-gray-800 px-3 py-1.5 rounded">NeuroAlgia</div>
+          <div class="bg-gray-800 px-3 py-1.5 rounded">NeuroAl</div>
         </div>
       </header>
 
