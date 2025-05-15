@@ -1,0 +1,49 @@
+{
+  "format": "layers-model",
+  "generatedBy": "TensorFlow.js v3.18.0",
+  "convertedBy": "TensorFlow.js Converter v3.18.0",
+  "modelTopology": {
+    "keras_version": "2.6.0",
+    "backend": "tensorflow",
+    "model_config": {
+      "class_name": "Model",
+      "config": {
+        "name": "iseg2017_winner",
+        "layers": [
+          {
+            "name": "input_1",
+            "class_name": "InputLayer",
+            "config": {
+              "batch_input_shape": [null, 128, 128, 2],
+              "dtype": "float32",
+              "sparse": false,
+              "ragged": false,
+              "name": "input_1"
+            },
+            "inbound_nodes": []
+          },
+          {
+            "name": "output",
+            "class_name": "Dense",
+            "config": {
+              "name": "output",
+              "trainable": true,
+              "dtype": "float32",
+              "units": 4,
+              "activation": "softmax"
+            },
+            "inbound_nodes": [[["input_1", 0, 0, {}]]]
+          }
+        ],
+        "input_layers": [["input_1", 0, 0]],
+        "output_layers": [["output", 0, 0]]
+      }
+    }
+  },
+  "weightsManifest": [
+    {
+      "paths": ["weights.bin"],
+      "weights": []
+    }
+  ]
+}

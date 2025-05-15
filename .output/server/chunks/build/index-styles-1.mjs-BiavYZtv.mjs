@@ -1,4 +1,0 @@
-const index_vue_vue_type_style_index_0_scoped_a7119513_lang = '.toggle[data-v-a7119513]{-webkit-appearance:none;-moz-appearance:none;appearance:none;background:#333;border-radius:9999px;cursor:pointer;height:16px;position:relative;width:32px}.toggle[data-v-a7119513]:checked{background:#3b82f6}.toggle[data-v-a7119513]:before{background:#fff;border-radius:9999px;content:"";height:12px;left:2px;position:absolute;top:2px;transition:transform .2s;width:12px}.toggle[data-v-a7119513]:checked:before{transform:translate(16px)}';
-
-export { index_vue_vue_type_style_index_0_scoped_a7119513_lang as i };
-//# sourceMappingURL=index-styles-1.mjs-BiavYZtv.mjs.map
