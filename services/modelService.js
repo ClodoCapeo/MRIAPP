@@ -1,5 +1,6 @@
 import * as tf from "@tensorflow/tfjs"
 import { EnhancedUNet } from "@/lib/unet-enhanced"
+import { gaussianNormalization } from "@/utils/volumeUtils"
 
 export class ModelService {
   constructor() {
@@ -69,19 +70,26 @@ export class ModelService {
 
   // Create a U-Net model matching the Python implementation
   createUNetModel(inputShape, outputChannels = 1, activation = "sigmoid") {
-    const inputs = tf.input({ shape: inputShape })
+    console.log(`Creating U-Net model with input shape ${JSON.stringify(inputShape)}, ${outputChannels} output channels, and ${activation} activation`);
+
+    const inputs = tf.input({ shape: inputShape });
+    console.log(`Created input layer: ${inputs.shape}`);
 
     // Encoder path
-    const conv1 = this.convBlock(inputs, 64)
-    const pool1 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv1)
+    console.log(`Building encoder path...`);
+    const conv1 = this.convBlock(inputs, 64);
+    console.log(`Conv1 shape: ${conv1.shape}`);
+    const pool1 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv1);
 
-    const conv2 = this.convBlock(pool1, 128)
-    const pool2 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv2)
+    const conv2 = this.convBlock(pool1, 128);
+    console.log(`Conv2 shape: ${conv2.shape}`);
+    const pool2 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv2);
 
-    const conv3 = this.convBlock(pool2, 256)
-    const pool3 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv3)
+    const conv3 = this.convBlock(pool2, 256);
+    console.log(`Conv3 shape: ${conv3.shape}`);
+    const pool3 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv3);
 
-    const conv4 = this.convBlock(pool3, 512)
+    const conv4 = this.convBlock(pool3, 512);
     const drop4 = tf.layers.dropout({ rate: 0.5 }).apply(conv4)
     const pool4 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(drop4)
 
@@ -241,26 +249,7 @@ export class ModelService {
 
   // Gaussian normalization function matching the Python implementation
   gaussianNormalization(volume) {
-    return tf.tidy(() => {
-      // Create a mask of non-zero values
-      const mask = volume.greater(0)
-
-      // Get non-zero values
-      const nonZeroValues = volume.mul(mask.cast("float32"))
-
-      // Calculate mean of non-zero values
-      const sum = nonZeroValues.sum()
-      const count = mask.sum().cast("float32")
-      const mean = sum.div(count)
-
-      // Calculate squared differences for std of non-zero values
-      const squaredDiff = nonZeroValues.sub(mean).square().mul(mask.cast("float32"))
-      const variance = squaredDiff.sum().div(count)
-      const std = variance.sqrt()
-
-      // Normalize: (volume - mean) / (5 * std)
-      return volume.sub(mean).div(std.mul(5))
-    })
+    return gaussianNormalization(volume);
   }
 
   async predict(inputVolumes) {
@@ -426,27 +415,5 @@ export class ModelService {
     })
   }
 }
-
-// Example usage
-// const modelService = new ModelService()
-// modelService.initialize().then(() => {
-//   modelService.loadHDF5Model(modelBuffer, "step1")
-//   modelService.setActiveModelType("step1")
-//   const prediction = modelService.predict([t1Volume, t2Volume])
-//   console.log("Prediction:", prediction)
-//   const dice = modelService.computeDice(prediction, groundTruth)
-//   console.log("Dice coefficient:", dice)
-// })
-//     }
-//     }
-//     return inputVolumes[0].clone()
-
-//   } catch (error) {
-//     console.error("Error during prediction:", error)
-//     throw error
-//   }
-
-//   }
-
 
 export default ModelService;

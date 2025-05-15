@@ -1,695 +1,374 @@
 import * as tf from "@tensorflow/tfjs"
+import { gaussianNormalization } from "@/utils/volumeUtils"
 
+/**
+ * Enhanced U-Net model for MRI brain segmentation
+ * Implements a cascaded approach with three stages:
+ * 1. Brain tissue segmentation (binary)
+ * 2. White matter segmentation (binary)
+ * 3. Multi-class tissue segmentation (4 classes)
+ */
 export class EnhancedUNet {
-  private model: tf.LayersModel | null = null
-  public modelStep1: tf.LayersModel | null = null
-  public modelStep2: tf.LayersModel | null = null
-  public modelStep3: tf.LayersModel | null = null
-  private readonly inputShape: [number, number, number] = [128, 128, 2] // Default: 2 channels (T1+T2)
-  private readonly numClasses: number = 4 // Multi-class segmentation (4 classes)
-  public modelPath = "indexeddb://unet-iseg-model" // Default model path
-  public modelPathStep1 = "indexeddb://unet-iseg-model-step1"
-  public modelPathStep2 = "indexeddb://unet-iseg-model-step2"
-  public modelPathStep3 = "indexeddb://unet-iseg-model-step3"
+    private step1Model: tf.LayersModel | null = null;
+    private step2Model: tf.LayersModel | null = null;
+    private step3Model: tf.LayersModel | null = null;
+    private isInitialized: boolean = false;
 
-  constructor(customModelPath?: string) {
-    if (customModelPath) {
-      this.modelPath = customModelPath
-    }
-  }
+    /**
+     * Initialize the model
+     * @param inputChannels Optional number of input channels (default: 2 for T1+T2)
+     */
+    async initialize(inputChannels: number = 2): Promise<void> {
+        if (this.isInitialized) return;
 
-  // Gaussian normalization function
-  private gaussianNormalization(image: tf.Tensor): tf.Tensor {
-    const positiveValues = image.where(image.greater(0), tf.zerosLike(image))
-    const mean = positiveValues.mean()
-    const std = positiveValues.std()
-    const normalizedImage = image.sub(mean).div(tf.scalar(5).mul(std))
-    return normalizedImage
-  }
+        try {
+            await tf.ready();
+            console.log("TensorFlow.js is ready");
 
-  async initialize(inputChannels = 2): Promise<void> {
-    try {
-      await tf.ready()
+            // Check for saved models
+            const modelInfo = await tf.io.listModels();
+            console.log("Available models:", modelInfo);
 
-      // Initialize Step 1 model (binary segmentation of brain)
-      try {
-        this.modelStep1 = await tf.loadLayersModel(this.modelPathStep1)
-        console.log(`Loaded model step 1 from ${this.modelPathStep1}`)
-      } catch (error) {
-        console.log("Creating new model step 1...")
-        this.modelStep1 = this.buildUNetModelBinary(inputChannels)
+            // Try to load previously saved models
+            try {
+                if (modelInfo["indexeddb://unet-iseg-model-step1"]) {
+                    this.step1Model = await tf.loadLayersModel("indexeddb://unet-iseg-model-step1");
+                    console.log("Loaded step 1 model from IndexedDB");
+                }
 
-        // Binary classification with binary crossentropy
-        this.modelStep1.compile({
-          optimizer: tf.train.adam(0.0001),
-          loss: "binaryCrossentropy",
-          metrics: ["accuracy"],
-        })
+                if (modelInfo["indexeddb://unet-iseg-model-step2"]) {
+                    this.step2Model = await tf.loadLayersModel("indexeddb://unet-iseg-model-step2");
+                    console.log("Loaded step 2 model from IndexedDB");
+                }
 
-        console.log("Model step 1 created and compiled")
-      }
+                if (modelInfo["indexeddb://unet-iseg-model-step3"]) {
+                    this.step3Model = await tf.loadLayersModel("indexeddb://unet-iseg-model-step3");
+                    console.log("Loaded step 3 model from IndexedDB");
+                }
+            } catch (e) {
+                console.log("No previously saved models found in IndexedDB:", e);
+            }
 
-      // Initialize Step 2 model (binary segmentation of white matter)
-      try {
-        this.modelStep2 = await tf.loadLayersModel(this.modelPathStep2)
-        console.log(`Loaded model step 2 from ${this.modelPathStep2}`)
-      } catch (error) {
-        console.log("Creating new model step 2...")
-        this.modelStep2 = this.buildUNetModelBinary(3) // Step 2 takes 3 channels (T1, T2, Step 1 output)
+            // If models weren't loaded, create new ones
+            if (!this.step1Model) {
+                console.log("Creating new step 1 model");
+                this.step1Model = this.createUNetModel([null, null, inputChannels], 1, "sigmoid");
+            }
 
-        this.modelStep2.compile({
-          optimizer: tf.train.adam(0.0001),
-          loss: "binaryCrossentropy",
-          metrics: ["accuracy"],
-        })
+            if (!this.step2Model) {
+                console.log("Creating new step 2 model");
+                this.step2Model = this.createUNetModel([null, null, inputChannels + 1], 1, "sigmoid");
+            }
 
-        console.log("Model step 2 created and compiled")
-      }
+            if (!this.step3Model) {
+                console.log("Creating new step 3 model");
+                this.step3Model = this.createUNetModel([null, null, inputChannels + 2], 4, "softmax");
+            }
 
-      // Initialize Step 3 model (multi-class segmentation)
-      try {
-        this.modelStep3 = await tf.loadLayersModel(this.modelPathStep3)
-        console.log(`Loaded model step 3 from ${this.modelPathStep3}`)
-      } catch (error) {
-        console.log("Creating new model step 3...")
-        this.modelStep3 = this.buildUNetModelMultiClass(4) // Step 3 takes 4 channels (T1, T2, Step 1, Step 2 outputs)
-
-        this.modelStep3.compile({
-          optimizer: tf.train.adam(0.0001),
-          loss: "categoricalCrossentropy",
-          metrics: ["accuracy"],
-        })
-
-        console.log("Model step 3 created and compiled")
-      }
-    } catch (error) {
-      console.error("Failed to initialize model:", error)
-      throw error
-    }
-  }
-
-  // Build U-Net model for binary segmentation (Step 1 and Step 2)
-  private buildUNetModelBinary(inputChannels = 2): tf.LayersModel {
-    // Input layer with dynamic channel count
-    const inputs = tf.input({ shape: [128, 128, inputChannels] })
-
-    // Encoder (Contracting Path)
-    const conv1 = this.convBlock(inputs, 64)
-    const pool1 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv1) as tf.SymbolicTensor
-
-    const conv2 = this.convBlock(pool1, 128)
-    const pool2 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv2) as tf.SymbolicTensor
-
-    const conv3 = this.convBlock(pool2, 256)
-    const pool3 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv3) as tf.SymbolicTensor
-
-    const conv4 = this.convBlock(pool3, 512)
-    const pool4 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv4) as tf.SymbolicTensor
-
-    // Bridge
-    const conv5 = this.convBlock(pool4, 1024)
-    const dropout = tf.layers.dropout({ rate: 0.3 }).apply(conv5) as tf.SymbolicTensor
-
-    // Decoder (Expansive Path)
-    const up6 = tf.layers.upSampling2d({ size: [2, 2] }).apply(dropout) as tf.SymbolicTensor
-    const up6Conv = tf.layers
-        .conv2d({
-          filters: 512,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up6) as tf.SymbolicTensor
-    const merge6 = tf.layers.concatenate().apply([conv4, up6Conv]) as tf.SymbolicTensor
-    const conv6 = this.convBlock(merge6, 512)
-
-    const up7 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv6) as tf.SymbolicTensor
-    const up7Conv = tf.layers
-        .conv2d({
-          filters: 256,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up7) as tf.SymbolicTensor
-    const merge7 = tf.layers.concatenate().apply([conv3, up7Conv]) as tf.SymbolicTensor
-    const conv7 = this.convBlock(merge7, 256)
-
-    const up8 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv7) as tf.SymbolicTensor
-    const up8Conv = tf.layers
-        .conv2d({
-          filters: 128,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up8) as tf.SymbolicTensor
-    const merge8 = tf.layers.concatenate().apply([conv2, up8Conv]) as tf.SymbolicTensor
-    const conv8 = this.convBlock(merge8, 128)
-
-    const up9 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv8) as tf.SymbolicTensor
-    const up9Conv = tf.layers
-        .conv2d({
-          filters: 64,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up9) as tf.SymbolicTensor
-    const merge9 = tf.layers.concatenate().apply([conv1, up9Conv]) as tf.SymbolicTensor
-    const conv9 = this.convBlock(merge9, 64)
-
-    // Output layer with sigmoid activation for binary classification
-    const outputs = tf.layers
-        .conv2d({
-          filters: 1, // Binary output (1 channel)
-          kernelSize: 1,
-          activation: "sigmoid",
-          padding: "same",
-        })
-        .apply(conv9) as tf.SymbolicTensor
-
-    return tf.model({ inputs, outputs })
-  }
-
-  // Build U-Net model for multi-class segmentation (Step 3)
-  private buildUNetModelMultiClass(inputChannels = 4): tf.LayersModel {
-    // Input layer with dynamic channel count
-    const inputs = tf.input({ shape: [128, 128, inputChannels] })
-
-    // Encoder (Contracting Path)
-    const conv1 = this.convBlock(inputs, 64)
-    const pool1 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv1) as tf.SymbolicTensor
-
-    const conv2 = this.convBlock(pool1, 128)
-    const pool2 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv2) as tf.SymbolicTensor
-
-    const conv3 = this.convBlock(pool2, 256)
-    const pool3 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv3) as tf.SymbolicTensor
-
-    const conv4 = this.convBlock(pool3, 512)
-    const pool4 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv4) as tf.SymbolicTensor
-
-    // Bridge
-    const conv5 = this.convBlock(pool4, 1024)
-    const dropout = tf.layers.dropout({ rate: 0.3 }).apply(conv5) as tf.SymbolicTensor
-
-    // Decoder (Expansive Path)
-    const up6 = tf.layers.upSampling2d({ size: [2, 2] }).apply(dropout) as tf.SymbolicTensor
-    const up6Conv = tf.layers
-        .conv2d({
-          filters: 512,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up6) as tf.SymbolicTensor
-    const merge6 = tf.layers.concatenate().apply([conv4, up6Conv]) as tf.SymbolicTensor
-    const conv6 = this.convBlock(merge6, 512)
-
-    const up7 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv6) as tf.SymbolicTensor
-    const up7Conv = tf.layers
-        .conv2d({
-          filters: 256,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up7) as tf.SymbolicTensor
-    const merge7 = tf.layers.concatenate().apply([conv3, up7Conv]) as tf.SymbolicTensor
-    const conv7 = this.convBlock(merge7, 256)
-
-    const up8 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv7) as tf.SymbolicTensor
-    const up8Conv = tf.layers
-        .conv2d({
-          filters: 128,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up8) as tf.SymbolicTensor
-    const merge8 = tf.layers.concatenate().apply([conv2, up8Conv]) as tf.SymbolicTensor
-    const conv8 = this.convBlock(merge8, 128)
-
-    const up9 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv8) as tf.SymbolicTensor
-    const up9Conv = tf.layers
-        .conv2d({
-          filters: 64,
-          kernelSize: 2,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(up9) as tf.SymbolicTensor
-    const merge9 = tf.layers.concatenate().apply([conv1, up9Conv]) as tf.SymbolicTensor
-    const conv9 = this.convBlock(merge9, 64)
-
-    // Output layer with softmax activation for multi-class segmentation
-    const outputs = tf.layers
-        .conv2d({
-          filters: this.numClasses, // Multi-class output (4 channels)
-          kernelSize: 1,
-          activation: "softmax",
-          padding: "same",
-        })
-        .apply(conv9) as tf.SymbolicTensor
-
-    return tf.model({ inputs, outputs })
-  }
-
-  // Enhanced convBlock with more parameters
-  private convBlock(inputs: tf.SymbolicTensor, filters: number): tf.SymbolicTensor {
-    const conv = tf.layers
-        .conv2d({
-          filters,
-          kernelSize: 3,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(inputs) as tf.SymbolicTensor
-
-    // Add batch normalization for better training stability
-    const batchNorm = tf.layers.batchNormalization().apply(conv) as tf.SymbolicTensor
-
-    return tf.layers
-        .conv2d({
-          filters,
-          kernelSize: 3,
-          activation: "relu",
-          padding: "same",
-          kernelInitializer: "heNormal",
-        })
-        .apply(batchNorm) as tf.SymbolicTensor
-  }
-
-  // Train Step 1 model (binary segmentation of brain)
-  async trainStep1(
-      trainXs: tf.Tensor4D,
-      trainYs: tf.Tensor4D,
-      valXs: tf.Tensor4D,
-      valYs: tf.Tensor4D,
-      epochs = 100,
-      batchSize = 1,
-      callbacks: tf.Callback[] = [],
-  ): Promise<tf.History> {
-    if (!this.modelStep1) {
-      throw new Error("Step 1 model not initialized")
+            this.isInitialized = true;
+            console.log("Enhanced U-Net initialized successfully");
+        } catch (error) {
+            console.error("Error initializing EnhancedUNet:", error);
+            throw error;
+        }
     }
 
-    console.log("Starting Step 1 training...")
-    console.log("Train shapes:", trainXs.shape, trainYs.shape)
-    console.log("Validation shapes:", valXs.shape, valYs.shape)
+    /**
+     * Create a U-Net model
+     * @param inputShape Input shape [height, width, channels]
+     * @param outputChannels Number of output channels
+     * @param activation Activation function for the output layer
+     * @returns U-Net model
+     */
+    private createUNetModel(inputShape: (number | null)[], outputChannels: number = 1, activation: string = "sigmoid"): tf.LayersModel {
+        console.log(`Creating U-Net model with input shape ${JSON.stringify(inputShape)}, ${outputChannels} output channels, and ${activation} activation`);
 
-    // Train the model
-    const history = await this.modelStep1.fit(trainXs, trainYs, {
-      epochs,
-      batchSize,
-      validationData: [valXs, valYs],
-      callbacks,
-      shuffle: true,
-    })
+        const inputs = tf.input({ shape: inputShape });
+        console.log(`Created input layer: ${inputs.shape}`);
 
-    return history
-  }
+        // Encoder path
+        console.log(`Building encoder path...`);
+        const conv1 = this.convBlock(inputs, 64);
+        console.log(`Conv1 shape: ${conv1.shape}`);
+        const pool1 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv1);
 
-  // Train Step 2 model (binary segmentation of white matter)
-  async trainStep2(
-      trainXs: tf.Tensor4D,
-      trainYs: tf.Tensor4D,
-      valXs: tf.Tensor4D,
-      valYs: tf.Tensor4D,
-      epochs = 100,
-      batchSize = 1,
-      callbacks: tf.Callback[] = [],
-  ): Promise<tf.History> {
-    if (!this.modelStep2) {
-      throw new Error("Step 2 model not initialized")
+        const conv2 = this.convBlock(pool1, 128);
+        console.log(`Conv2 shape: ${conv2.shape}`);
+        const pool2 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv2);
+
+        const conv3 = this.convBlock(pool2, 256);
+        console.log(`Conv3 shape: ${conv3.shape}`);
+        const pool3 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(conv3);
+
+        const conv4 = this.convBlock(pool3, 512);
+        const drop4 = tf.layers.dropout({ rate: 0.5 }).apply(conv4);
+        const pool4 = tf.layers.maxPooling2d({ poolSize: [2, 2] }).apply(drop4);
+
+        // Bridge
+        const conv5 = this.convBlock(pool4, 1024);
+        const drop5 = tf.layers.dropout({ rate: 0.5 }).apply(conv5);
+
+        // Decoder path
+        const up6 = tf.layers.upSampling2d({ size: [2, 2] }).apply(drop5);
+        const up6Conv = tf.layers
+            .conv2d({
+                filters: 512,
+                kernelSize: 2,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(up6);
+        const merge6 = tf.layers.concatenate().apply([drop4, up6Conv]);
+        const conv6 = this.convBlock(merge6, 512);
+
+        const up7 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv6);
+        const up7Conv = tf.layers
+            .conv2d({
+                filters: 256,
+                kernelSize: 2,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(up7);
+        const merge7 = tf.layers.concatenate().apply([conv3, up7Conv]);
+        const conv7 = this.convBlock(merge7, 256);
+
+        const up8 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv7);
+        const up8Conv = tf.layers
+            .conv2d({
+                filters: 128,
+                kernelSize: 2,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(up8);
+        const merge8 = tf.layers.concatenate().apply([conv2, up8Conv]);
+        const conv8 = this.convBlock(merge8, 128);
+
+        const up9 = tf.layers.upSampling2d({ size: [2, 2] }).apply(conv8);
+        const up9Conv = tf.layers
+            .conv2d({
+                filters: 64,
+                kernelSize: 2,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(up9);
+        const merge9 = tf.layers.concatenate().apply([conv1, up9Conv]);
+        const conv9 = this.convBlock(merge9, 64);
+        const conv9_2 = tf.layers
+            .conv2d({
+                filters: 2,
+                kernelSize: 3,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(conv9);
+
+        // Output layer
+        const outputs = tf.layers
+            .conv2d({
+                filters: outputChannels,
+                kernelSize: 1,
+                activation: activation,
+                padding: "same",
+            })
+            .apply(conv9_2);
+
+        const model = tf.model({ inputs, outputs });
+
+        // Compile the model
+        model.compile({
+            optimizer: tf.train.adam(1e-4),
+            loss: outputChannels > 1 ? "categoricalCrossentropy" : "binaryCrossentropy",
+            metrics: ["accuracy"],
+        });
+
+        return model;
     }
 
-    console.log("Starting Step 2 training...")
-    console.log("Train shapes:", trainXs.shape, trainYs.shape)
-    console.log("Validation shapes:", valXs.shape, valYs.shape)
+    /**
+     * Create a convolutional block
+     * @param inputs Input tensor
+     * @param filters Number of filters
+     * @returns Output tensor
+     */
+    private convBlock(inputs: tf.SymbolicTensor, filters: number): tf.SymbolicTensor {
+        const conv = tf.layers
+            .conv2d({
+                filters,
+                kernelSize: 3,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(inputs);
 
-    // Train the model
-    const history = await this.modelStep2.fit(trainXs, trainYs, {
-      epochs,
-      batchSize,
-      validationData: [valXs, valYs],
-      callbacks,
-      shuffle: true,
-    })
-
-    return history
-  }
-
-  // Train Step 3 model (multi-class segmentation)
-  async trainStep3(
-      trainXs: tf.Tensor4D,
-      trainYs: tf.Tensor4D,
-      valXs: tf.Tensor4D,
-      valYs: tf.Tensor4D,
-      epochs = 100,
-      batchSize = 1,
-      callbacks: tf.Callback[] = [],
-  ): Promise<tf.History> {
-    if (!this.modelStep3) {
-      throw new Error("Step 3 model not initialized")
+        return tf.layers
+            .conv2d({
+                filters,
+                kernelSize: 3,
+                activation: "relu",
+                padding: "same",
+                kernelInitializer: "heNormal",
+            })
+            .apply(conv);
     }
 
-    console.log("Starting Step 3 training...")
-    console.log("Train shapes:", trainXs.shape, trainYs.shape)
-    console.log("Validation shapes:", valXs.shape, valYs.shape)
-
-    // Train the model
-    const history = await this.modelStep3.fit(trainXs, trainYs, {
-      epochs,
-      batchSize,
-      validationData: [valXs, valYs],
-      callbacks,
-      shuffle: true,
-    })
-
-    return history
-  }
-
-  // Legacy train method for backward compatibility
-  async train(
-      trainData: { xs: tf.Tensor4D; ys: tf.Tensor4D }[],
-      validationData: { xs: tf.Tensor4D; ys: tf.Tensor4D }[],
-      epochs = 100,
-      batchSize = 1,
-      callbacks: tf.Callback[] = [],
-  ): Promise<tf.History> {
-    if (!this.modelStep1) {
-      throw new Error("Model not initialized")
-    }
-
-    if (trainData.length === 0) {
-      throw new Error("No training data provided")
-    }
-
-    try {
-      // Log shapes for debugging
-      console.log("Training data shapes:")
-      trainData.forEach((item, i) => {
-        console.log(`Item ${i}: xs shape=${item.xs.shape}, ys shape=${item.ys.shape}`)
-      })
-
-      // Flatten the data arrays
-      console.log("Concatenating training data...")
-      const trainXs = tf.concat(
-          trainData.map((d) => d.xs),
-          0,
-      )
-      const trainYs = tf.concat(
-          trainData.map((d) => d.ys),
-          0,
-      )
-
-      console.log("Training data concatenated. Shapes:", trainXs.shape, trainYs.shape)
-
-      let valXs, valYs
-      if (validationData.length > 0) {
-        console.log("Concatenating validation data...")
-        valXs = tf.concat(
-            validationData.map((d) => d.xs),
-            0,
-        )
-        valYs = tf.concat(
-            validationData.map((d) => d.ys),
-            0,
-        )
-        console.log("Validation data concatenated. Shapes:", valXs.shape, valYs.shape)
-      }
-
-      // Train the model
-      console.log("Starting model.fit...")
-      const history = await this.modelStep1.fit(trainXs, trainYs, {
-        epochs,
-        batchSize,
-        validationData: valXs && valYs ? [valXs, valYs] : undefined,
-        callbacks,
-        shuffle: true,
-      })
-
-      // Clean up
-      trainXs.dispose()
-      trainYs.dispose()
-      if (valXs) valXs.dispose()
-      if (valYs) valYs.dispose()
-
-      return history
-    } catch (error) {
-      console.error("Error during training:", error)
-      throw error
-    }
-  }
-
-  // The predict method needs to be updated to properly handle the cascaded prediction process
-  // and ensure we're correctly using the outputs from each step as inputs to the next step.
-
-  // Update the predict method to clearly show the cascaded approach:
-  async predict(inputVolumes: tf.Tensor3D[]): Promise<tf.Tensor3D> {
-    // If models aren't initialized and we're just viewing ground truth
-    if ((!this.modelStep1 || !this.modelStep2 || !this.modelStep3) && inputVolumes.length === 1) {
-      // Just return the input volume (assuming it's the ground truth)
-      return inputVolumes[0].clone()
-    }
-
-    if (!this.modelStep1 || !this.modelStep2 || !this.modelStep3) {
-      throw new Error("Models not initialized")
-    }
-
-    if (inputVolumes.length === 0) {
-      throw new Error("No input volumes provided")
-    }
-
-    return tf.tidy(() => {
-      try {
-        // Get volume dimensions from the first volume
-        const [width, height, depth] = inputVolumes[0].shape
-
-        // Check that all volumes have the same dimensions
-        for (let i = 1; i < inputVolumes.length; i++) {
-          if (!tf.util.arraysEqual(inputVolumes[0].shape, inputVolumes[i].shape)) {
-            throw new Error(
-                `Input volumes must have the same dimensions. Volume 0: ${inputVolumes[0].shape}, Volume ${i}: ${inputVolumes[i].shape}`,
-            )
-          }
+    /**
+     * Predict segmentation for a specific step
+     * @param inputVolumes Array of input volumes [t1Volume, t2Volume]
+     * @param step Step number (1, 2, or 3)
+     * @returns Segmentation volume
+     */
+    async predictStep(inputVolumes: tf.Tensor[], step: number): Promise<tf.Tensor> {
+        if (!this.isInitialized) {
+            await this.initialize();
         }
 
-        // Process each slice and combine results
-        const resultSlices: tf.Tensor3D[] = []
+        return tf.tidy(() => {
+            try {
+                const [t1Volume, t2Volume] = inputVolumes;
 
-        for (let z = 0; z < depth; z++) {
-          // Extract 2D slices from each volume
-          const slices = inputVolumes.map((volume) =>
-              volume.slice([0, 0, z], [width, height, 1]).reshape([width, height]),
-          )
+                // Get dimensions
+                const [width, height, depth] = t1Volume.shape;
 
-          // Resize slices to 128x128
-          const resizedSlices = slices.map((slice) =>
-              tf.image.resizeBilinear(slice.expandDims(2), [128, 128]).squeeze(),
-          )
+                // Create output volume
+                const resultSlices = [];
 
-          // STEP 1: Brain Segmentation
-          // Combine slices into a single input tensor for Step 1 (T1 and T2 only)
-          const step1Input = tf.stack(resizedSlices.slice(0, 2), 2).expandDims(0)
+                // Process each slice
+                for (let z = 0; z < depth; z++) {
+                    // Extract slices
+                    const t1Slice = t1Volume.slice([0, 0, z], [width, height, 1]).reshape([width, height]);
+                    const t2Slice = t2Volume.slice([0, 0, z], [width, height, 1]).reshape([width, height]);
 
-          // Normalize to [0,1]
-          const normalizedStep1Input = step1Input.div(step1Input.max())
+                    // Normalize slices
+                    const t1SliceNorm = gaussianNormalization(t1Slice);
+                    const t2SliceNorm = gaussianNormalization(t2Slice);
 
-          // Run Step 1 prediction (brain segmentation)
-          const step1Prediction = this.modelStep1.predict(normalizedStep1Input) as tf.Tensor4D
-          const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze(0)
+                    if (step === 1) {
+                        // Step 1: Brain tissue segmentation
+                        const step1Input = tf.stack([t1SliceNorm, t2SliceNorm], 2).expandDims(0);
+                        const step1Prediction = this.step1Model!.predict(step1Input) as tf.Tensor;
+                        const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze([0, 3]);
+                        resultSlices.push(step1Binary.expandDims(2));
+                    } else if (step === 2) {
+                        // Step 2: White matter segmentation
+                        // First get step 1 prediction
+                        const step1Input = tf.stack([t1SliceNorm, t2SliceNorm], 2).expandDims(0);
+                        const step1Prediction = this.step1Model!.predict(step1Input) as tf.Tensor;
+                        const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze([0, 3]);
 
-          // STEP 2: White Matter Segmentation
-          // Combine T1, T2, and Step 1 prediction for Step 2
-          const step2Input = tf
-              .concat([resizedSlices[0].expandDims(2), resizedSlices[1].expandDims(2), step1Binary], 2)
-              .expandDims(0)
+                        // Then do step 2
+                        const step2Input = tf.stack([t1SliceNorm, t2SliceNorm, step1Binary], 2).expandDims(0);
+                        const step2Prediction = this.step2Model!.predict(step2Input) as tf.Tensor;
+                        const step2Binary = step2Prediction.greater(0.5).toFloat().squeeze([0, 3]);
+                        resultSlices.push(step2Binary.expandDims(2));
+                    } else if (step === 3) {
+                        // Step 3: Multi-class segmentation
+                        // First get step 1 prediction
+                        const step1Input = tf.stack([t1SliceNorm, t2SliceNorm], 2).expandDims(0);
+                        const step1Prediction = this.step1Model!.predict(step1Input) as tf.Tensor;
+                        const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze([0, 3]);
 
-          // Run Step 2 prediction (white matter segmentation)
-          const step2Prediction = this.modelStep2.predict(step2Input) as tf.Tensor4D
-          const step2Binary = step2Prediction.greater(0.5).toFloat().squeeze(0)
+                        // Then get step 2 prediction
+                        const step2Input = tf.stack([t1SliceNorm, t2SliceNorm, step1Binary], 2).expandDims(0);
+                        const step2Prediction = this.step2Model!.predict(step2Input) as tf.Tensor;
+                        const step2Binary = step2Prediction.greater(0.5).toFloat().squeeze([0, 3]);
 
-          // STEP 3: Multi-class Segmentation
-          // Combine T1, T2, Step 1, and Step 2 predictions for Step 3
-          const step3Input = tf
-              .concat([resizedSlices[0].expandDims(2), resizedSlices[1].expandDims(2), step1Binary, step2Binary], 2)
-              .expandDims(0)
+                        // Finally do step 3
+                        const step3Input = tf.stack([t1SliceNorm, t2SliceNorm, step1Binary, step2Binary], 2).expandDims(0);
+                        const step3Prediction = this.step3Model!.predict(step3Input) as tf.Tensor;
+                        const segmentation = tf.argMax(step3Prediction, 3).squeeze([0]);
+                        resultSlices.push(segmentation.expandDims(2));
+                    }
+                }
 
-          // Run Step 3 prediction (multi-class segmentation)
-          const step3Prediction = this.modelStep3.predict(step3Input) as tf.Tensor4D
+                // Concatenate all slices along the z-axis
+                return tf.concat(resultSlices, 2);
+            } catch (error) {
+                console.error("Error during prediction:", error);
+                throw error;
+            }
+        });
+    }
 
-          // Get class with highest probability for each pixel
-          const segmentation = tf.argMax(step3Prediction, 3).squeeze() as tf.Tensor2D
+    /**
+     * Predict segmentation using all three steps
+     * @param inputVolumes Array of input volumes [t1Volume, t2Volume]
+     * @returns Segmentation volume
+     */
+    async predict(inputVolumes: tf.Tensor[]): Promise<tf.Tensor> {
+        return this.predictStep(inputVolumes, 3);
+    }
 
-          // Resize back to original dimensions
-          const resizedSegmentation = tf.image
-              .resizeBilinear(segmentation.expandDims(2), [width, height], true)
-              .squeeze()
-
-          // Convert back to integer classes
-          const finalSegmentation = tf.cast(tf.round(resizedSegmentation), "int32")
-
-          // Add to result slices
-          resultSlices.push(finalSegmentation.expandDims(2))
+    /**
+     * Train the model for a specific step
+     * @param xTrain Training data
+     * @param yTrain Training labels
+     * @param step Step number (1, 2, or 3)
+     * @param epochs Number of epochs
+     * @param batchSize Batch size
+     * @returns Training history
+     */
+    async train(xTrain: tf.Tensor, yTrain: tf.Tensor, step: number = 1, epochs: number = 10, batchSize: number = 8): Promise<tf.History> {
+        if (!this.isInitialized) {
+            await this.initialize();
         }
 
-        // Concatenate all slices along the z-axis
-        return tf.concat(resultSlices, 2)
-      } catch (error) {
-        console.error("Error during prediction:", error)
-        throw error
-      }
-    })
-  }
-
-  // Add a method to get intermediate predictions for visualization during training
-  async predictStep(inputVolumes: tf.Tensor3D[], step: number): Promise<tf.Tensor3D> {
-    if (!this.modelStep1 || !this.modelStep2 || !this.modelStep3) {
-      throw new Error("Models not initialized")
-    }
-
-    if (inputVolumes.length === 0) {
-      throw new Error("No input volumes provided")
-    }
-
-    return tf.tidy(() => {
-      try {
-        // Get volume dimensions from the first volume
-        const [width, height, depth] = inputVolumes[0].shape
-
-        // Process each slice and combine results
-        const resultSlices: tf.Tensor3D[] = []
-
-        for (let z = 0; z < depth; z++) {
-          // Extract 2D slices from each volume
-          const slices = inputVolumes.map((volume) =>
-              volume.slice([0, 0, z], [width, height, 1]).reshape([width, height]),
-          )
-
-          // Resize slices to 128x128
-          const resizedSlices = slices.map((slice) =>
-              tf.image.resizeBilinear(slice.expandDims(2), [128, 128]).squeeze(),
-          )
-
-          let segmentation: tf.Tensor2D
-
-          if (step === 1) {
-            // STEP 1: Brain Segmentation (binary)
-            const step1Input = tf.stack(resizedSlices.slice(0, 2), 2).expandDims(0)
-            const normalizedStep1Input = step1Input.div(step1Input.max())
-            const step1Prediction = this.modelStep1.predict(normalizedStep1Input) as tf.Tensor4D
-            segmentation = step1Prediction.greater(0.5).toFloat().squeeze([0, 3]) as tf.Tensor2D
-          } else if (step === 2) {
-            // STEP 2: White Matter Segmentation
-            // First run Step 1
-            const step1Input = tf.stack(resizedSlices.slice(0, 2), 2).expandDims(0)
-            const normalizedStep1Input = step1Input.div(step1Input.max())
-            const step1Prediction = this.modelStep1.predict(normalizedStep1Input) as tf.Tensor4D
-            const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze(0)
-
-            // Then run Step 2 using Step 1 output
-            const step2Input = tf
-                .concat([resizedSlices[0].expandDims(2), resizedSlices[1].expandDims(2), step1Binary], 2)
-                .expandDims(0)
-            const step2Prediction = this.modelStep2.predict(step2Input) as tf.Tensor4D
-            segmentation = step2Prediction.greater(0.5).toFloat().squeeze([0, 3]) as tf.Tensor2D
-          } else {
-            // STEP 3: Multi-class Segmentation
-            // First run Step 1
-            const step1Input = tf.stack(resizedSlices.slice(0, 2), 2).expandDims(0)
-            const normalizedStep1Input = step1Input.div(step1Input.max())
-            const step1Prediction = this.modelStep1.predict(normalizedStep1Input) as tf.Tensor4D
-            const step1Binary = step1Prediction.greater(0.5).toFloat().squeeze(0)
-
-            // Then run Step 2
-            const step2Input = tf
-                .concat([resizedSlices[0].expandDims(2), resizedSlices[1].expandDims(2), step1Binary], 2)
-                .expandDims(0)
-            const step2Prediction = this.modelStep2.predict(step2Input) as tf.Tensor4D
-            const step2Binary = step2Prediction.greater(0.5).toFloat().squeeze(0)
-
-            // Finally run Step 3
-            const step3Input = tf
-                .concat([resizedSlices[0].expandDims(2), resizedSlices[1].expandDims(2), step1Binary, step2Binary], 2)
-                .expandDims(0)
-            const step3Prediction = this.modelStep3.predict(step3Input) as tf.Tensor4D
-            segmentation = tf.argMax(step3Prediction, 3).squeeze() as tf.Tensor2D
-          }
-
-          // Resize back to original dimensions
-          const resizedSegmentation = tf.image
-              .resizeBilinear(segmentation.expandDims(2), [width, height], true)
-              .squeeze()
-
-          // Convert to appropriate type
-          const finalSegmentation = tf.cast(tf.round(resizedSegmentation), "int32")
-
-          // Add to result slices
-          resultSlices.push(finalSegmentation.expandDims(2))
+        let model: tf.LayersModel;
+        if (step === 1) {
+            model = this.step1Model!;
+        } else if (step === 2) {
+            model = this.step2Model!;
+        } else {
+            model = this.step3Model!;
         }
 
-        // Concatenate all slices along the z-axis
-        return tf.concat(resultSlices, 2)
-      } catch (error) {
-        console.error(`Error during step ${step} prediction:`, error)
-        throw error
-      }
-    })
-  }
+        // Train the model
+        const history = await model.fit(xTrain, yTrain, {
+            epochs,
+            batchSize,
+            validationSplit: 0.1,
+            callbacks: {
+                onEpochEnd: (epoch, logs) => {
+                    console.log(`Step ${step}, Epoch ${epoch + 1}/${epochs} - loss: ${logs?.loss.toFixed(4)}, accuracy: ${logs?.acc.toFixed(4)}`);
+                }
+            }
+        });
 
-  // Update the predictWithPostProcessing method to use the cascaded approach
-  async predictWithPostProcessing(inputVolumes: tf.Tensor3D[]): Promise<tf.Tensor3D> {
-    // First get the raw prediction using the cascaded approach
-    const prediction = await this.predict(inputVolumes)
+        // Save the model
+        await model.save(`indexeddb://unet-iseg-model-step${step}`);
+        console.log(`Step ${step} model saved to IndexedDB`);
 
-    // Apply post-processing (e.g., smoothing, connected component analysis)
-    return tf.tidy(() => {
-      try {
-        // For now, we'll just return the prediction as is
-        // In a real implementation, you might apply additional post-processing steps
-        return prediction
-      } catch (error) {
-        console.error("Error during post-processing:", error)
-        throw error
-      }
-    })
-  }
-
-  async saveModel(path = "indexeddb://unet-iseg-model"): Promise<tf.io.SaveResult> {
-    if (!this.modelStep1) {
-      throw new Error("Model not initialized")
+        return history;
     }
-    return await this.modelStep1.save(path)
-  }
 
-  getModelPath(): string {
-    return this.modelPath
-  }
+    /**
+     * Save all models
+     */
+    async saveModels(): Promise<void> {
+        if (!this.isInitialized) {
+            throw new Error("Models not initialized");
+        }
 
-  setModelPath(path: string): void {
-    this.modelPath = path
-  }
+        if (this.step1Model) {
+            await this.step1Model.save("indexeddb://unet-iseg-model-step1");
+        }
+        if (this.step2Model) {
+            await this.step2Model.save("indexeddb://unet-iseg-model-step2");
+        }
+        if (this.step3Model) {
+            await this.step3Model.save("indexeddb://unet-iseg-model-step3");
+        }
 
-  // Dice coefficient calculation
-  dice(X: tf.Tensor, Y: tf.Tensor): number {
-    const XBIN = X.greater(0)
-    const YBIN = Y.greater(0)
-    const INTERSECTION = tf.sum(tf.logicalAnd(XBIN, YBIN)).dataSync()[0]
-    const XCARD = tf.sum(XBIN).dataSync()[0]
-    const YCARD = tf.sum(YBIN).dataSync()[0]
-    const diceCoefficient = (2.0 * INTERSECTION) / (XCARD + YCARD)
-    return XCARD + YCARD > 0 ? diceCoefficient : -1
-  }
+        console.log("All models saved to IndexedDB");
+    }
 }
+
+export default gaussianNormalization;

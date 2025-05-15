@@ -132,9 +132,6 @@
 import { ref, watch, computed, onMounted } from 'vue';
 import * as tf from '@tensorflow/tfjs';
 import { EnhancedUNet } from '@/lib/unet-enhanced';
-import AnalyzeFileUploader from '@/components/AnalyzeFileUploader.vue';
-import VolumeViewer from '@/components/VolumeViewer.vue';
-import ModelTrainerEnhanced from '@/components/ModelTrainerEnhanced.vue';
 import MriSegmentation from '@/components/MriSegmentation.vue';
 
 // State
